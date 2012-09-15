@@ -193,10 +193,10 @@ class Genghis_Api extends Genghis_App
         $server = self::parseServerDsn($data['name']);
 
         $this->initServers();
-        $this->servers[$server['name']] = $server;
+        $this->servers[$server['id']] = $server;
         $this->saveServers();
 
-        return $this->showServer($server['name']);
+        return $this->showServer($server['id']);
     }
 
     protected function removeServer($name)
@@ -212,50 +212,65 @@ class Genghis_Api extends Genghis_App
         throw new Genghis_HttpException(404, sprintf("Server '%s' not found", $name));
     }
 
-    protected function showServer($name)
+    protected function serverIdToName($id)
     {
-        $this->initServers();
-        if (!isset($this->servers[$name])) {
-            throw new Genghis_HttpException(404, sprintf("Server '%s' not found", $name));
-        }
-
-        return new Genghis_JsonResponse($this->dumpServer($name));
+        return preg_replace('/^(.+)~(.+)~(.+)$/', '\1@\2/\3', $id);
     }
 
-    protected function dumpServer($name)
+    protected function showServer($id)
     {
+        $this->initServers();
+        if (!isset($this->servers[$id])) {
+            throw new Genghis_HttpException(404, sprintf("Server '%s' not found", $this->serverIdToName($id)));
+        }
+
+        return new Genghis_JsonResponse($this->dumpServer($id));
+    }
+
+    protected function dumpServer($id)
+    {
+        $info = $this->servers[$id];
+
         $server = array(
-            'id'       => $name,
-            'name'     => $name,
-            'editable' => !(isset($this->servers[$name]['default']) && $this->servers[$name]['default']),
+            'id'       => $info['id'],
+            'name'     => $info['name'],
+            'editable' => !(isset($info['default']) && $info['default']),
         );
 
-        if (isset($this->servers[$name]['error'])) {
-            $server['error'] = $this->servers[$name]['error'];
+        if (isset($info['error'])) {
+            $server['error'] = $info['error'];
 
             return $server;
         }
 
         try {
-            $res = $this->getMongo($name)->listDBs();
+            // special case for authenticated connections
+            if (isset($info['db'])) {
+                $totalSize = null;
+                $dbs = array($info['db']);
+            } else {
+                $res = $this->getMongo($id)->listDBs();
 
-            if (isset($res['errmsg'])) {
-                $server['error'] = 'Unable to connect to Mongo server at "'.$name.'": '.$res['errmsg'].'.';
+                if (isset($res['errmsg'])) {
+                    $server['error'] = 'Unable to connect to Mongo server at "'.$this->serverIdToName($id).'": '.$res['errmsg'].'.';
 
-                return $server;
+                    return $server;
+                }
+
+                $totalSize = $res['totalSize'];
+                $dbs = array_map(function($db) {
+                    return $db['name'];
+                }, $res['databases']);
             }
 
-            $dbs = array_map(function($db) {
-                return $db['name'];
-            }, $res['databases']);
 
             return array_merge($server, array(
-                'size'      => $res['totalSize'],
+                'size'      => $totalSize,
                 'count'     => count($dbs),
                 'databases' => $dbs,
             ));
         } catch (Exception $e) {
-            $server['error'] = 'Unable to connect to Mongo server at "'.$name.'".';
+            $server['error'] = 'Unable to connect to Mongo server at "'.$this->serverIdToName($id).'".';
 
             return $server;
         }
@@ -282,17 +297,18 @@ class Genghis_Api extends Genghis_App
                 }
 
                 $server['default'] = true;
-                $this->servers[$server['name']] = $server;
+                $this->servers[$server['id']] = $server;
             }
 
             if (isset($_COOKIE['genghis_servers']) && $localDsns = $this->decodeJson($_COOKIE['genghis_servers'], false)) {
                 foreach (array_map(array($this, 'parseServerDsn'), $localDsns) as $server) {
-                    $this->servers[$server['name']] = $server;
+                    $this->servers[$server['id']] = $server;
                 }
             }
 
             if (empty($this->servers)) {
                 $this->servers['localhost'] = array(
+                    'id'   => 'localhost',
                     'name' => 'localhost',
                     'dsn'  => 'localhost:27017',
                 );
@@ -344,8 +360,14 @@ class Genghis_Api extends Genghis_App
         if (isset($chunks['port']) && $chunks['port'] !== 27017) {
             $name .= ':'.$chunks['port'];
         }
+        if (isset($chunks['path'])) {
+            $db = trim($chunks['path'], '/');
+            $name .= '/'.$db;
+        }
 
-        return compact('name', 'dsn', 'options');
+        $id = strtr($name, '@/', '~~');
+
+        return compact('id', 'name', 'dsn', 'db', 'options');
     }
 
     protected function dumpDatabase($server, $database)
@@ -387,9 +409,14 @@ class Genghis_Api extends Genghis_App
     {
         $dbs   = array();
         $mongo = $this->getMongo($server);
-        $res   = $this->getMongo($server)->listDBs();
-        foreach ($res['databases'] as $db) {
-            $dbs[] = $this->dumpDatabase($server, $db['name']);
+
+        if (isset($this->servers[$server]['db'])) {
+            $dbs[] = $this->dumpDatabase($server, $this->servers[$server]['db']);
+        } else {
+            $res   = $this->getMongo($server)->listDBs();
+            foreach ($res['databases'] as $db) {
+                $dbs[] = $this->dumpDatabase($server, $db['name']);
+            }
         }
 
         return new Genghis_JsonResponse($dbs);
